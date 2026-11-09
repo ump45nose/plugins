@@ -533,3 +533,52 @@ test("anti-ban isolation: passes --disable-telemetry and isolated --gemini-dir, 
     await Promise.all([reqA.then(readSse), reqB.then(readSse)])
   })
 })
+
+test("session headers: chat.headers and x-magpie-session / x-magpie-subagent isolate identical opening prompts while preserving session reuse", async () => {
+  await withKit({}, async (kit) => {
+    scriptedAgent(kit)
+
+    // 1. chat.headers populates x-magpie-agy-session for agy-cli only, ignoring synthetic magpie-<24 hex> IDs.
+    const headersA = {}
+    await kit.plugin["chat.headers"]({ sessionID: "ses_alpha", model: { providerID: "agy-cli" } }, { headers: headersA })
+    assert.equal(headersA["x-magpie-agy-session"], "ses_alpha")
+
+    const headersOther = {}
+    await kit.plugin["chat.headers"]({ sessionID: "ses_alpha", model: { providerID: "other" } }, { headers: headersOther })
+    assert.equal(headersOther["x-magpie-agy-session"], undefined)
+
+    const headersSynthetic = {}
+    await kit.plugin["chat.headers"]({ sessionID: "magpie-0123456789abcdef01234567", model: { providerID: "agy-cli" } }, { headers: headersSynthetic })
+    assert.equal(headersSynthetic["x-magpie-agy-session"], undefined)
+
+    // 2. Identical opening prompt + identical metadata.user_id with different session headers spawn distinct ACP sessions.
+    const identicalOpening = baseBody({ metadata: { user_id: "shared-user" }, messages: [{ role: "user", content: "Hi" }] })
+    const firstA = await readSse(await kit.request(identicalOpening, { headers: headersA }))
+    assert.equal(firstA.stopReason, "end_turn")
+    assert.equal(kit.acpSpawns.length, 1)
+
+    const firstB = await readSse(await kit.request(identicalOpening, { headers: { "x-magpie-session": "ses_beta" } }))
+    assert.equal(firstB.stopReason, "end_turn")
+    assert.equal(kit.acpSpawns.length, 2, "distinct session header must isolate identical opening prompt into a new ACP session")
+
+    // 3. Subagent header isolates a subagent from the parent session even when sharing the same session header and opening prompt.
+    const subagentTurn = await readSse(await kit.request(identicalOpening, {
+      headers: { "x-magpie-session": "ses_beta", "x-magpie-subagent": "sub_1" },
+    }))
+    assert.equal(subagentTurn.stopReason, "end_turn")
+    assert.equal(kit.acpSpawns.length, 3, "x-magpie-subagent must isolate subagent from parent session")
+
+    // 4. Follow-up turn on ses_alpha reuses its existing ACP session without spawning a 4th process.
+    const followUpA = {
+      ...identicalOpening,
+      messages: [
+        ...identicalOpening.messages,
+        { role: "assistant", content: firstA.content.map((b) => ({ type: "text", text: b.text })) },
+        { role: "user", content: "Follow up on alpha" },
+      ],
+    }
+    const secondA = await readSse(await kit.request(followUpA, { headers: headersA }))
+    assert.equal(secondA.stopReason, "end_turn")
+    assert.equal(kit.acpSpawns.length, 3, "follow-up with matching session header must reuse the live ACP session")
+  })
+})
