@@ -12,7 +12,7 @@ import net from "node:net"
 import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
-import { createUsageReader } from "./usage.mjs"
+import { createUsageReader, parseAuthenticatedAccount } from "./usage.mjs"
 import { startLogin } from "./login.mjs"
 
 const PROVIDER_ID = "agy-cli"
@@ -375,6 +375,18 @@ const OFFERED_PROBE_TIMEOUT_MS = 30_000
 const OFFERED_PROBE_RETRY_MS = 60_000
 let offeredProbePromise = null
 let offeredProbeAt = null
+let authenticatedAccount = ""
+let onAuthenticatedAccount = null
+
+async function noteAuthenticatedLog(logPath) {
+  if (!logPath) return ""
+  const user = parseAuthenticatedAccount(await fs.promises.readFile(logPath, "utf8").catch(() => ""))
+  if (user) {
+    authenticatedAccount = user
+    try { await onAuthenticatedAccount?.(user) } catch {}
+  }
+  return user
+}
 
 function killQuietly(child) {
   try { child.stdin?.end() } catch {}
@@ -403,7 +415,8 @@ async function probeOfferedModels(agyPath) {
   let timer
   try {
     workspace = await fs.promises.mkdtemp(path.join(os.tmpdir(), "magpie-agy-models-"))
-    child = spawnAgy(agyPath, ["acp", ...acpIsolationArgs()], { cwd: workspace, stdio: ["pipe", "pipe", "pipe"], windowsHide: true })
+    const logPath = path.join(workspace, "agy-acp.log")
+    child = spawnAgy(agyPath, ["acp", ...acpIsolationArgs(), "--log-file", logPath], { cwd: workspace, stdio: ["pipe", "pipe", "pipe"], windowsHide: true })
     child.on("error", () => conn?.close(new Error("agy acp failed to start")))
     child.on("close", () => conn?.close(new Error("agy acp exited")))
     child.stdin?.on("error", () => {})
@@ -426,6 +439,7 @@ async function probeOfferedModels(agyPath) {
       if (agyTooOld(init?.agentInfo?.version ?? null)) return
       const session = await conn.request("session/new", { cwd: workspace, mcpServers: [] })
       noteOfferedModels(session?.configOptions, session?.models)
+      await noteAuthenticatedLog(logPath)
       const caps = init?.agentCapabilities ?? {}
       if (session?.sessionId && (caps.sessionCapabilities?.close ?? caps.session_capabilities?.close)) {
         await conn.request("session/close", { sessionId: session.sessionId }).catch(() => {})
@@ -1427,6 +1441,7 @@ class Proc {
     this.currentModel = session?.models?.currentModelId ?? null
     this.configOptions = Array.isArray(session?.configOptions) ? session.configOptions : []
     noteOfferedModels(this.configOptions, session?.models)
+    await noteAuthenticatedLog(this.logPath)
     if (this.model) await this.#setModel(this.model, this.selection, this.resumed)
     if (this.tools.length) await this.#waitForToolList(this.toolsVersion)
   }
@@ -4357,14 +4372,34 @@ async function beginTurn(proc, history, body, callerWorkDir, model, selection, o
   return proc.startTurn(contentParts, body.messages, model, selection, options)
 }
 
-export const AntigravityBridgePlugin = async () => {
+export const AntigravityBridgePlugin = async (input) => {
+  const client = input?.client
+  const syncAccount = async (user) => {
+    if (!user) return
+    authenticatedAccount = user
+    try {
+      await client?.auth?.set?.({
+        path: { id: PROVIDER_ID },
+        body: { type: "api", key: "agy", accountId: user, metadata: { email: user } },
+      })
+    } catch {}
+  }
+  onAuthenticatedAccount = syncAccount
   const readUsage = createUsageReader(findAgy)
   return {
     auth: {
       provider: PROVIDER_ID,
       single: true,
       // Magpie's usage hook; OpenCode ignores this extension. agy owns auth.
-      usage: async () => readUsage(),
+      usage: async () => {
+        const result = await readUsage()
+        const user = result.user || authenticatedAccount
+        if (user) {
+          await syncAccount(user)
+          return result.user ? result : { ...result, user }
+        }
+        return result
+      },
       methods: [
         {
           // agy's own Google sign-in (`agy acp --login`): magpie opens its
@@ -4383,7 +4418,16 @@ export const AntigravityBridgePlugin = async () => {
             }
             // signed in to agy already: nothing to open
             if ((await probeSignedIn(agy)).ok) {
-              return { url: "", instructions: "", method: "auto", callback: async () => ({ type: "success", key: "agy" }) }
+              return {
+                url: "",
+                instructions: "",
+                method: "auto",
+                callback: async () => ({
+                  type: "success",
+                  key: "agy",
+                  ...(authenticatedAccount ? { accountId: authenticatedAccount, metadata: { email: authenticatedAccount } } : {}),
+                }),
+              }
             }
             const login = await startLogin(agy)
             if (login.error) return { type: "failed", error: login.error }
@@ -4396,7 +4440,13 @@ export const AntigravityBridgePlugin = async () => {
                 if (done.error) return { type: "failed", error: done.error }
                 const probe = await probeSignedIn(agy)
                 if (!probe.ok) return { type: "failed", error: `agy signed in, but ${probe.why}` }
-                return { type: "success", key: "agy" }
+                const user = parseAuthenticatedAccount(done.said) || authenticatedAccount
+                if (user) authenticatedAccount = user
+                return {
+                  type: "success",
+                  key: "agy",
+                  ...(user ? { accountId: user, metadata: { email: user } } : {}),
+                }
               },
             }
           },
@@ -4621,6 +4671,7 @@ export const AntigravityBridgePlugin = async () => {
         const agy = findAgy()
         // Never force a refresh here: Magpie times models() out after about two seconds.
         const catalog = await loadModelCatalog(agy, { probeOffered: true })
+        if (authenticatedAccount) await syncAccount(authenticatedAccount)
         const out = {}
         for (const model of catalog.models) {
           const imageModel = /^(?:gemini-|claude-)/.test(model.id)

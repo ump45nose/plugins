@@ -6,7 +6,7 @@ import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { test } from "node:test"
-import { createUsageReader, fetchUsage, parseUsageReport } from "../usage.mjs"
+import { createUsageReader, fetchUsage, maskAccount, parseAuthenticatedAccount, parseUsageReport } from "../usage.mjs"
 
 const report = groups => ({ status: "SUCCESS", command: { name: "usage", data: { groups } } })
 const group = (buckets, name = "Gemini Models") => ({ name, buckets })
@@ -144,6 +144,10 @@ else if (version) {
   child.unref()
   console.log(process.env.TEST_REPORT)
 } else {
+  const logFlag = args.indexOf("--log-file")
+  if (logFlag >= 0 && args[logFlag + 1] && process.env.TEST_AUTH_LOG) {
+    fs.writeFileSync(args[logFlag + 1], process.env.TEST_AUTH_LOG)
+  }
   if (mode === "delay") await new Promise(resolve => setTimeout(resolve, 150))
   console.log(process.env.TEST_REPORT)
 }
@@ -521,4 +525,23 @@ test("missing executables and filesystem failures do not leak local paths", asyn
   const result = await createUsageReader(() => f.executable, { ...f.options, tempRoot: f.executable })()
   assert.ok(result.error)
   assert.doesNotMatch(result.error, /agy-usage-test-/)
+})
+
+test("masks authenticated account emails while keeping head and tail identifiable", async t => {
+  assert.equal(maskAccount("sk01056250327@gmail.com"), "sk0***327@gmail.com")
+  assert.equal(maskAccount("ywk13656817536@gmail.com"), "ywk***536@gmail.com")
+  assert.equal(maskAccount("ywk1729065735@gmail.com"), "ywk***735@gmail.com")
+  assert.equal(maskAccount("alice@example.com"), "al***ce@example.com")
+  assert.equal(maskAccount("test@example.com"), "t***t@example.com")
+  assert.equal(maskAccount("ab@example.com"), "a***@example.com")
+  assert.equal(parseAuthenticatedAccount("I1110 20:17:51.811192 1 server_oauth.go:221] applyAuthResult: email=sk01056250327@gmail.com, authMethod=consumer\n"), "sk0***327@gmail.com")
+  assert.equal(parseAuthenticatedAccount("Logged in as ywk13656817536@gmail.com."), "ywk***536@gmail.com")
+
+  const f = await fixture(t, {
+    TEST_AUTH_LOG: "I1110 20:17:51.811202 1 server_oauth.go:226] OAuth: authenticated successfully as sk01056250327@gmail.com\n",
+  })
+  const result = await createUsageReader(() => f.executable, f.options)()
+  assert.equal(result.user, "sk0***327@gmail.com")
+  assert.equal(result.windows[0].used, 25)
+  await f.assertClean()
 })

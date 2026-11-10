@@ -13,6 +13,45 @@ class UsageError extends Error {}
 const text = value => typeof value === "string" ? value.trim() : ""
 const field = (value, camel, snake) => value?.[camel] ?? value?.[snake]
 
+function maskToken(value) {
+  if (value.length <= 2) return `${value[0]}***`
+  if (value.length <= 4) return `${value[0]}***${value.slice(-1)}`
+  if (value.length <= 6) return `${value.slice(0, 2)}***${value.slice(-2)}`
+  return `${value.slice(0, 3)}***${value.slice(-3)}`
+}
+
+export function maskAccount(value) {
+  const raw = text(value).replace(/^["']+|["'.,;]+$/g, "")
+  if (!raw) return ""
+  const at = raw.lastIndexOf("@")
+  if (at > 0) {
+    const local = raw.slice(0, at)
+    const domain = raw.slice(at + 1)
+    if (!local || !domain || !domain.includes(".") || /\s/.test(raw)) return ""
+    return `${maskToken(local)}@${domain}`
+  }
+  return /\s/.test(raw) ? "" : maskToken(raw)
+}
+
+const ACCOUNT_PATTERNS = [
+  /applyAuthResult:\s*email=([^\s,"']+)/g,
+  /\b(?:OAuth:\s*)?authenticated successfully as\s+"?([^\s"']+)"?/gi,
+  /\b(?:logged in|already authenticated|authenticated) as\s+"?([^\s"']+)"?/gi,
+]
+
+export function parseAuthenticatedAccount(value) {
+  const input = String(value ?? "")
+  if (!input) return ""
+  let found = ""
+  for (const pattern of ACCOUNT_PATTERNS) {
+    for (const match of input.matchAll(pattern)) {
+      const candidate = text(match[1]).replace(/[.,;]+$/, "")
+      if (/^[^\s@]+@[^\s@]+\.[^\s@.]+$/.test(candidate)) found = candidate
+    }
+  }
+  return found ? maskAccount(found) : ""
+}
+
 function commandFailure(output) {
   if (/not (?:logged|signed) in|unauthenticated|authentication required|login required|please (?:log|sign) in|sign in again/i.test(output)) {
     return new UsageError("agy usage needs authentication. Run `agy` in a terminal to sign in again.")
@@ -248,9 +287,12 @@ export async function fetchUsage(agy, {
     const version = await run(agy, ["--version"], { ...options, deadline: Math.min(deadline, Date.now() + 8000) })
     if (version.code !== 0) throw commandFailure(version.stderr)
     if (!supportedVersion(version.stdout)) throw new UsageError("agy usage reports require a verified agy version 1.1.11 or later. Update the CLI.")
-    const result = await run(agy, ["-p", "/usage", "--output-format", "json", "--agent", "magpie-usage", "--print-timeout", `${Math.max(1, Math.ceil((deadline - Date.now()) / 1000))}s`], options)
+    const logFile = path.join(directory, "cli.log")
+    const result = await run(agy, ["-p", "/usage", "--output-format", "json", "--agent", "magpie-usage", "--print-timeout", `${Math.max(1, Math.ceil((deadline - Date.now()) / 1000))}s`, "--log-file", logFile], options)
     if (result.code !== 0) throw commandFailure(result.stderr + "\n" + result.stdout)
-    return parseUsageReport(result.stdout)
+    const report = parseUsageReport(result.stdout)
+    const user = parseAuthenticatedAccount(await fs.readFile(logFile, "utf8").catch(() => ""))
+    return user ? { ...report, user } : report
   } finally {
     for (let attempt = 0; attempt < 4; attempt++) {
       try {
