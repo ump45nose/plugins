@@ -10,7 +10,7 @@ import * as childProcess from "node:child_process"
 import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, sep } from "node:path"
-import { QoderAuthPlugin, QoderCNAuthPlugin } from "./index.mjs"
+import { QoderAuthPlugin, QoderCNAuthPlugin, QwenWorkAuthPlugin, QwenWorkEnterpriseAuthPlugin } from "./index.mjs"
 
 const real = globalThis.fetch
 const originalRuntime = process.env.QODER_RUNTIME_INFO
@@ -44,6 +44,9 @@ const OCT27 = LIVE.campaigns[0]
 // the next day's, as Qoder lists one: a day later, the same length
 const OCT28 = { ...OCT27, campaignId: "oct28", campaignKey: "act-20261028-1", startAt: OCT27.startAt + 86400, endAt: OCT27.endAt + 86400 }
 const listOf = (...cs) => ({ ...LIVE, campaigns: cs })
+const extra = (id, amount) => ({ ...OCT28, campaignId: id, endAt: OCT28.startAt + 7 * 86400,
+  benefit: { kind: "CREDITS", amount }, placements: [{ content: { en: { title: "Trial pack" } } }] })
+const withDetail = (url) => ({ ...OCT28, placements: [{ content: { en: { detailUrl: url } } }] })
 
 const account = () => ({
   type: "oauth", access: "jt", refresh: "rt", expires: Date.now() + 3_600_000,
@@ -77,6 +80,46 @@ test("the live list's fixture is the day before's campaign, 10:00 to 09:59 (UTC+
 
 for (const make of [QoderAuthPlugin, QoderCNAuthPlugin]) {
   const site = make === QoderAuthPlugin ? "qoder" : "qoder-cn"
+
+  if (site === "qoder") {
+  test(`${site}: trial packs before the daily campaign never take its claim or boundary`, async () => {
+    setSystemTime(new Date("2026-10-28T02:01:30Z"))
+    const p = await checkin(make, listOf(extra("sonus", 2000), extra("ultimate", 500), OCT28))
+    expect(p.claims).toEqual(["oct28"])
+    expect(p.out).toEqual({ outcome: "claimed", credit: 100, until: askAt(29) })
+  })
+
+  test(`${site}: an already claimed daily stays done despite available trial packs`, async () => {
+    setSystemTime(new Date("2026-10-28T02:01:30Z"))
+    const p = await checkin(make, listOf(extra("sonus", 2000), { ...OCT28, claimStatus: "CLAIMED" }))
+    expect(p.claims).toEqual([])
+    expect(p.out).toEqual({ outcome: "done", credit: 100, until: askAt(29) })
+  })
+
+  test(`${site}: only trial or details campaigns do not make a claim`, async () => {
+    setSystemTime(new Date("2026-10-28T02:01:30Z"))
+    const p = await checkin(make, listOf(extra("sonus", 2000), { ...OCT28, actionType: "VIEW_DETAILS" }))
+    expect(p.claims).toEqual([])
+    expect(p.out.outcome).toBe("inactive")
+  })
+
+  test(`${site}: daily docs URL and active window identify the campaign`, async () => {
+    setSystemTime(new Date("2026-10-28T02:01:30Z"))
+    for (const url of ["https://docs.qoder.com/events/100credits", "https://docs.qoder.com/zh/events/100credits"]) {
+      const p = await checkin(make, listOf(withDetail(url)))
+      expect(p.claims).toEqual(["oct28"])
+    }
+    for (const url of ["https://docs.qoder.com.attacker.test/events/100credits", "https://docs.qoder.com/events/100credits-other", "http://docs.qoder.com/events/100credits"]) {
+      const p = await checkin(make, listOf(withDetail(url)))
+      expect(p.claims).toEqual([])
+      expect(p.out.outcome).toBe("inactive")
+    }
+    for (const campaign of [{ ...OCT28, startAt: undefined }, { ...OCT28, endAt: OCT28.startAt }, { ...OCT28, startAt: OCT28.startAt + 3600 }]) {
+      const p = await checkin(make, listOf(campaign))
+      expect(p.claims).toEqual([])
+    }
+  })
+  }
 
   test(`${site}: before 10:00 the day before's credits are claimed, and the check-in asks again at 10:00`, async () => {
     setSystemTime(new Date("2026-10-28T01:27:00Z")) // 09:27 (UTC+8), as the live list was read
@@ -113,6 +156,19 @@ for (const make of [QoderAuthPlugin, QoderCNAuthPlugin]) {
     expect(p.out).toEqual({ outcome: "failed", message: "campaigns: today's credits aren't offered yet", until: askAt(28) })
   })
 }
+
+test("qoder-cn keeps its prior check-in behavior without the international daily URL", async () => {
+  setSystemTime(new Date("2026-10-28T02:01:30Z"))
+  const p = await checkin(QoderCNAuthPlugin, listOf(extra("cn-campaign", 100)))
+  expect(p.claims).toEqual(["cn-campaign"])
+})
+
+test("QwenWork providers still do not expose a check-in hook", async () => {
+  for (const make of [QwenWorkAuthPlugin, QwenWorkEnterpriseAuthPlugin]) {
+    const hooks = await make({ client: { auth: { set: async () => {} } } })
+    expect(hooks.auth.checkin).toBeUndefined()
+  }
+})
 
 test("a campaign longer than a day is asked again at its end", async () => {
   setSystemTime(new Date("2026-10-28T03:00:00Z"))

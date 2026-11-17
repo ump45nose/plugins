@@ -2882,6 +2882,24 @@ function campaignTarget(base, s, url) {
   return u.href
 }
 
+// Only the daily credits campaign is a check-in. Other campaigns can offer
+// trial packs with the same action and status, but have different effects.
+function dailyCampaign(c) {
+  if (c?.actionType !== "CLAIM_BENEFIT") return false
+  const start = at(c.startAt), end = at(c.endAt)
+  if (start == null || end == null || start >= end) return false
+  return (Array.isArray(c.placements) ? c.placements : []).some((p) =>
+    Object.values(p?.content ?? {}).some((content) => {
+      try {
+        const url = new URL(content?.detailUrl)
+        return url.origin === "https://docs.qoder.com" && !url.username && !url.password &&
+          /^\/(?:zh\/)?events\/100credits\/?$/.test(url.pathname)
+      } catch {
+        return false
+      }
+    }))
+}
+
 // campaignCall is url asked with the device token; Qoder's answer comes back
 // as it is.
 async function campaignCall(url, method, body, deviceToken, machine, signal) {
@@ -3679,8 +3697,10 @@ const makePlugin = (site) => async ({ client }) => {
       if (listRes.status !== 200) return { outcome: "failed", message: `campaigns: HTTP ${listRes.status}` }
       const now = Date.now()
       const active = (c) => (at(c.startAt) ?? -Infinity) <= now && now < (at(c.endAt) ?? Infinity)
-      const campaigns = (Array.isArray(list.campaigns) ? list.campaigns : []).filter((x) => x?.actionType === "CLAIM_BENEFIT")
-      const campaign = campaigns.find((x) => x.claimStatus === "CLAIMABLE")
+      const dailyOnly = site.id === "qoder"
+      const campaigns = (Array.isArray(list.campaigns) ? list.campaigns : []).filter(
+        (x) => dailyOnly ? dailyCampaign(x) : x?.actionType === "CLAIM_BENEFIT")
+      const campaign = campaigns.find((x) => x.claimStatus === "CLAIMABLE" && (!dailyOnly || active(x)))
       if (!campaign) {
         const done = campaigns.find((x) => x.claimStatus === "CLAIMED" && active(x))
         if (done) {
